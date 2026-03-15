@@ -198,11 +198,14 @@ LOG_FILE="$LOG_FILE"
 
 # Destinations rsync via the-bastion
 # Format : <compte-bastion>@<bastion-ip>:<srv-backup-ip>@<backup-user><dest-path>
-RSYNC_DEST="\${BASTION_ACCOUNT}@\${BASTION_IP}:\${SRV_BACKUP_IP}@\${SRV_BACKUP_USER}\${BACKUP_DEST}"
+# Wrapper SSH pour the-bastion (syntaxe --osh rsync)
+# Doc : https://ovh.github.io/the-bastion/plugins/open/rsync.html
+RSYNC_RSH="ssh -T -i \${KEY_FILE} -o StrictHostKeyChecking=accept-new -o BatchMode=yes \${BASTION_ACCOUNT}@\${BASTION_IP} -p 22 -- --osh rsync --"
+RSYNC_DEST="\${SRV_BACKUP_USER}@\${SRV_BACKUP_IP}:\${BACKUP_DEST}"
 
 # Options rsync
 RSYNC_OPTS=(
-    -avz
+    -va
     --delete
     --delete-excluded
     --exclude="*.tmp"
@@ -231,9 +234,9 @@ for src in "\${SOURCES[@]}"; do
     log "Sync: \$src → \$RSYNC_DEST\$(basename \$src)/"
 
     rsync "\${RSYNC_OPTS[@]}" \\
-        -e "ssh -i \$KEY_FILE -o StrictHostKeyChecking=accept-new -o BatchMode=yes" \\
+        --rsh "\${RSYNC_RSH}" \\
         "\$src" \\
-        "\$RSYNC_DEST/\$(basename \$src)/" || {
+        "\${RSYNC_DEST}/\$(basename \$src)/" || {
             log "ERROR: échec rsync pour \$src"
             ERRORS=\$((ERRORS + 1))
         }

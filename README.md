@@ -14,13 +14,18 @@ Scripts pour automatiser la mise en place d'un flux rsync sécurisé via [the-ba
 - **1 compte bastion par serveur source** : `backup-<nom-serveur>`
 - **1 groupe `rsync-backup`** : contient `srv-backup` comme cible, avec le protocole rsync autorisé
 - Chaque compte source est **membre** du groupe → utilise la clé egress du groupe pour joindre srv-backup
-- **srv-backup ne fait confiance qu'à une seule clé** : la clé egress du groupe (récupérée à l'étape 1)
+- **srv-backup ne fait confiance qu'à une seule clé** : la clé egress du groupe
+
+---
 
 ## Prérequis
 
 - Accès admin au bastion (compte avec droits `accountCreate`, `groupCreate`)
 - `srv-backup` accessible depuis le bastion en SSH (port 22 par défaut)
 - Un user `usr-rsync` créé sur `srv-backup` avec son répertoire `~/.ssh/`
+- `rsync` installé sur **les deux** serveurs (source ET destination)
+
+---
 
 ## Procédure manuelle sur the-bastion — Ajouter un serveur cible
 
@@ -31,14 +36,16 @@ Scripts pour automatiser la mise en place d'un flux rsync sécurisé via [the-ba
 
 ```bash
 # Étape 1a — Accès SSH (prérequis obligatoire)
-bssh --osh groupAddServer --group rsync --host HOST --port PORT --user USER
+bssh --osh groupAddServer --group rsync-backup --host HOST --port PORT --user USER
 
 # Étape 1b — Accès rsync (même groupe = même clé egress)
-bssh --osh groupAddServer --group rsync --host HOST --port PORT --protocol rsync
+bssh --osh groupAddServer --group rsync-backup --host HOST --port PORT --protocol rsync
 ```
 
 > ⚠️ Les deux commandes sont nécessaires : la 1a ouvre l'accès SSH de base, la 1b active
 > le protocole rsync par-dessus. Sans la 1a, la 1b seule ne suffit pas.
+
+---
 
 ## Utilisation
 
@@ -79,8 +86,7 @@ bssh --osh groupAddServer --group rsync --host HOST --port PORT --protocol rsync
   --server-name zabbix \
   --bastion-ip 192.168.2.102 \
   --srv-backup-ip 192.168.2.111 \
-  --srv-backup-user usr-rsync \
-  --backup-src /etc /var/lib/zabbix
+  --backup-src "/etc /var/lib/zabbix"
 ```
 
 → Génère une clé SSH dédiée backup sur le serveur source  
@@ -88,14 +94,86 @@ bssh --osh groupAddServer --group rsync --host HOST --port PORT --protocol rsync
 → Crée le script de backup `/opt/backup/run-backup.sh`  
 → Installe un cron quotidien
 
-## Commande rsync générée (pour info)
+### Étape 4 — Injecter la clé d'hôte de srv-backup dans le bastion
+
+> Cette étape est nécessaire car `--osh rsync` tourne dans le contexte du compte
+> `backup-<name>` sur le bastion, qui a son propre `known_hosts` distinct de celui
+> utilisé par `groupAddServer`.
+
+Depuis **Proxmox** (si le bastion est une VM avec `qemu-guest-agent`) :
 
 ```bash
-rsync -avz --delete \
-  -e "ssh -i /opt/backup/id_ed25519 -o StrictHostKeyChecking=accept-new" \
-  /source/path/ \
-  backup-myserver@bastion_ip:srv-backup_ip@usr-rsync/backup/myserver/
+# Récupérer la clé d'hôte de srv-backup
+HOSTKEY=$(ssh-keyscan -t ed25519 <srv-backup-ip> 2>/dev/null | grep ssh-ed25519)
+
+# L'injecter dans le known_hosts du compte backup ET dans le global
+qm guest exec <bastion-vmid> --pass-stdin 0 -- bash -c "
+  mkdir -p /home/backup-<name>/.ssh
+  echo '$HOSTKEY' >> /home/backup-<name>/.ssh/known_hosts
+  chown -R backup-<name>: /home/backup-<name>/.ssh
+  chmod 600 /home/backup-<name>/.ssh/known_hosts
+  echo '$HOSTKEY' >> /etc/ssh/ssh_known_hosts
+"
 ```
+
+> 💡 Répéter pour chaque nouveau compte `backup-<name>`.
+
+---
+
+## Commande rsync (syntaxe the-bastion)
+
+> ⚠️ La syntaxe rsync via the-bastion utilise `--rsh` avec `--osh rsync --`,
+> **pas** `-e "ssh ..."` classique.
+
+```bash
+rsync -va --rsh "ssh -T -i /opt/backup/id_ed25519 \
+  -o StrictHostKeyChecking=accept-new \
+  -o BatchMode=yes \
+  backup-<name>@<bastion-ip> -p 22 -- --osh rsync --" \
+  /source/path/ \
+  usr-rsync@<srv-backup-ip>:/backup/<name>/
+```
+
+---
+
+## Prérequis serveur destination (srv-backup / LXC Proxmox)
+
+Si `srv-backup` est un **LXC Proxmox sous Debian**, appliquer ces fixes au moment du provisioning :
+
+### 1. Désactiver `pam_systemd` (évite un timeout de 25s à chaque connexion SSH)
+
+```bash
+sed -i 's/^session.*pam_systemd.so.*$/# & # disabled: no logind in LXC/' \
+  /etc/pam.d/common-session
+systemctl reload ssh
+```
+
+### 2. Installer rsync
+
+```bash
+apt-get install -y rsync
+```
+
+### 3. Créer l'utilisateur `usr-rsync`
+
+```bash
+useradd -m -s /bin/bash usr-rsync
+mkdir -p /home/usr-rsync/.ssh /backup
+chown -R usr-rsync: /home/usr-rsync/.ssh /backup
+chmod 700 /home/usr-rsync/.ssh
+```
+
+### 4. Déposer la clé egress du groupe rsync-backup
+
+```bash
+# Récupérer la clé via : ssh admin@bastion -- --osh groupInfo --group rsync-backup
+echo 'from="..." ssh-ed25519 AAAA... rsync-backup@the-bastion' \
+  > /home/usr-rsync/.ssh/authorized_keys
+chmod 600 /home/usr-rsync/.ssh/authorized_keys
+chown usr-rsync: /home/usr-rsync/.ssh/authorized_keys
+```
+
+---
 
 ## Structure du repo
 
